@@ -13,14 +13,17 @@ import pandas as pd
 import _pickle as pkl
 import os
 import scipy.stats as stats
-
+from tqdm import trange
 
 # 		    		Mean 				Stddev
 # z:         -0.05088775275065709 	0.38221495666871064
 # intensity: 11.663070406395152 	43.84871921181538
 # ring:      3.3788556751238974 	12.618955142552485
-CHANNEL_MEAN = [-0.0501, 11.6631, 3.3789]
-CHANNEL_STD = [0.3822, 43.8487, 12.6190]
+MAPLITE_CHANNEL_MEAN = [-0.0501, 11.6631, 3.3789]
+MAPLITE_CHANNEL_STD = [0.3822, 43.8487, 12.6190]
+
+KITTI_CHANNEL_MEAN = [-0.05202304122738282, 2.358081049820253, 0.8665825618483107]
+KITTI_CHANNEL_STD = [0.32765755502250743, 12.816899303219458, 4.4047826816784275]
 
 
 # Translation of John Cook's C++ code for the Welford's algorithm
@@ -64,12 +67,19 @@ def flatten_pc(pc, features, sz=(1,1), statistics=None):
 	axes=['x','y']
 	statistics = ['mean' for i in range(len(features))] if not statistics else statistics
 	xy=np.vstack(pc[ax] for ax in axes).T
-	sz=(1,1)
-	# mins=xy.min(0)
-	# maxs=xy.max(0)
-	# Magic numbers, estimated by inspecting several pointclouds
-	mins = [-120, -120]
-	maxs = [120, 120]
+
+	if(args.dataset_use=='maplite'):
+		# mins=xy.min(0)
+		# maxs=xy.max(0)
+		# Magic numbers, estimated by inspecting several pointclouds
+		sz=(1,1)
+		mins = [-120, -120]
+		maxs = [120, 120]
+	else:
+
+		sz=(0.5,0.5)
+		mins = [0, -50]
+		maxs = [100, 50]
 	bins=[np.arange(mins[i], maxs[i]+sz[i], sz[i]) for i in range(len(axes))]
 	N=[len(b) for b in bins]
 	
@@ -96,6 +106,9 @@ if __name__ == '__main__':
 
 	parser.add_argument('-pkl', type=file_exists, dest='pickle_file', \
 		help='Path to MapLite annotated pkl file, to create train/test data from.')
+	parser.add_argument('-dataset', dest='dataset_use', \
+		help='Which dataset to use: maplite/kitti')
+
 	parser.add_argument('-outDir', type=file_exists, dest='target_dir', help='Directory to store generated data.')
 	parser.add_argument('--compute-mean', action='store_true', dest='compute_mean', \
 		help='Compute channelwise mean and standard deviation.')
@@ -107,37 +120,47 @@ if __name__ == '__main__':
 	# Create directories to store the image and label, if they do not already exist
 	image_dir = os.path.join(args.target_dir, 'seg_data')
 	label_dir = os.path.join(args.target_dir, 'seg_label')
+	test_dir = os.path.join(args.target_dir, 'test_label')
+	test_imgz_dir = os.path.join(args.target_dir, 'test_img_z')
+
 	if not os.path.isdir(args.target_dir):
 		os.makedirs(args.target_dir)
 	if not os.path.isdir(image_dir):
 		os.makedirs(image_dir)
 		os.makedirs(label_dir)
-
+		os.makedirs(test_dir)
+		os.makedirs(test_imgz_dir)
 	# Number of scans
 	num_scans = len(all_scans.index)
 
+	if(args.dataset_use=='maplite'):
+		CHANNEL_MEAN = MAPLITE_CHANNEL_MEAN
+		CHANNEL_STD = MAPLITE_CHANNEL_STD
+	else:
+		CHANNEL_MEAN = KITTI_CHANNEL_MEAN
+		CHANNEL_STD = KITTI_CHANNEL_STD
 	# Helper objects to compute running mean and stddev
 	if args.compute_mean:
 		stats_z = RunningStats()
 		stats_intensity = RunningStats()
 		stats_ring = RunningStats()
 
-	for i in range(num_scans):
-		print(i)
+	for i in trange(num_scans):
 		scan = all_scans.iloc[i]['scan']
 		road = all_scans.iloc[i]['is_road_truth']
-		nan = all_scans.iloc[i]['nan']
 		pc = np.array(scan,dtype={'names':('x','y','z','intensity','ring'), \
 			'formats':('f8','f8','f8','<u4','b')})
 		pc = append_fields(pc, 'road', road, dtypes='?')
-		pc = append_fields(pc, 'nan', nan, dtypes='?')
-		pc = pc[pc['nan'] != True] # Remove NaNs
+		if(args.dataset_use=='maplite'):
+			nan = all_scans.iloc[i]['nan']
+			pc = append_fields(pc, 'nan', nan, dtypes='?')
+			pc = pc[pc['nan'] != True] # Remove NaNs
 
 		# Compute features from pointcloud
 		feat = flatten_pc(pc, ['z','intensity','ring'])
-		
+
 		# Update statistics
-		if args.compute_stats:
+		if args.compute_mean:
 			stats_z.push(np.ndarray.flatten(feat[:,:,0]))
 			stats_intensity.push(np.ndarray.flatten(feat[:,:,1]))
 			stats_ring.push(np.ndarray.flatten(feat[:,:,2]))
@@ -145,9 +168,10 @@ if __name__ == '__main__':
 		# Channel-wise normalization
 		for j in range(3):
 			feat[:,:,j] = (feat[:,:,j] - CHANNEL_MEAN[j]) / CHANNEL_STD[j]
-			feat[:,:,j] = (255 * feat[:,:,j])
+			# feat[:,:,j] = (255 * feat[:,:,j])	# Old and awesome normalization :)
+			feat[:,:,j] = (127.5 * (feat[:,:,j]+1))
 		feat = feat.astype(np.uint8)
-
+		test_imgz = feat[:,:,0]
 		# Create label png
 		label = flatten_pc(pc, ['road'])
 		label_img = np.zeros(label.shape, dtype=np.uint8)
@@ -155,18 +179,26 @@ if __name__ == '__main__':
 		label_img[np.where(label==0)] = 1
 		label_img = label_img[:,:,0]
 
+
+		test_img = np.zeros(label.shape, dtype=np.uint8)
+		test_img[np.where(label>0)] = 255
+		test_img = test_img[:,:,0]
+
 		# Write images
 		imageio.imwrite(os.path.join(image_dir, str(i).zfill(4) + '.png'), feat)
 		imageio.imwrite(os.path.join(label_dir, str(i).zfill(4) + '.png'), label_img)
+		imageio.imwrite(os.path.join(test_dir, str(i).zfill(4) + '.png'), test_img)
+		imageio.imwrite(os.path.join(test_imgz_dir, str(i).zfill(4) + '.png'), test_imgz)
+
 
 	if args.compute_mean:
 		stats_file = open(os.path.join(args.target_dir, 'stats.txt'), 'w')
-		stats_file.write('z_mean: ',  str(stats_z.mean()), '\n')
-		stats_file.write('z_stddev: ',  str(stats_z.stddev()), '\n')
-		stats_file.write('intensity_mean: ',  str(stats_intensity.mean()), '\n')
-		stats_file.write('intensity_stddev: ',  str(stats_intensity.stddev()), '\n')
-		stats_file.write('ring_mean: ',  str(stats_ring.mean()), '\n')
-		stats_file.write('ring_stddev: ',  str(stats_ring.stddev()), '\n')
+		stats_file.write('z_mean: '+ str(stats_z.mean())+ '\n')
+		stats_file.write('z_stddev: '+  str(stats_z.stddev())+ '\n')
+		stats_file.write('intensity_mean: '+  str(stats_intensity.mean())+ '\n')
+		stats_file.write('intensity_stddev: '+  str(stats_intensity.stddev())+ '\n')
+		stats_file.write('ring_mean: '+  str(stats_ring.mean())+ '\n')
+		stats_file.write('ring_stddev: '+  str(stats_ring.stddev())+ '\n')
 		print(stats_z.mean(), stats_z.stddev())
 		print(stats_intensity.mean(), stats_intensity.stddev())
 		print(stats_ring.mean(), stats_ring.stddev())
